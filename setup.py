@@ -2147,6 +2147,153 @@ def drop_archive(z: Path) -> None:
     z.with_name(z.name + ".done").unlink(missing_ok=True)
 
 
+DL_PIECE = 64 << 20                                   # one ranged request of a parallel download
+
+
+class NoRanges(Exception):
+    """The server answered a ranged request with the whole file (200): a parallel download cannot use it."""
+
+
+def download_connections() -> int:
+    """How many connections a large download opens at once: STRATA_DOWNLOAD_CONNECTIONS, default 8 (1 = a single
+    connection, as before).  One connection to Hugging Face's CDN can run at a tenth of the line's speed (3 MB/s
+    on a 210 Mbit/s line), so the 30-110 GB of a model took hours longer than it had to."""
+    try:
+        return max(1, min(32, int(os.environ.get("STRATA_DOWNLOAD_CONNECTIONS", "8"))))
+    except ValueError:
+        return 8
+
+
+def partial_size(dst: Path) -> int:
+    """Bytes of a download that stopped part-way: its .part, or the .ppart of a parallel one."""
+    return max((f.stat().st_size for f in (dst.with_name(dst.name + ".part"), dst.with_name(dst.name + ".ppart"))
+                if f.is_file()), default=0)
+
+
+def parallel_state(dst: Path) -> Path:
+    """The progress file of a parallel download: which pieces of <name>.ppart are written."""
+    return dst.with_name(dst.name + ".ppart.json")
+
+
+def download_parallel(url, dst: Path, total: int, what: str, conns: int) -> bool:
+    """Download a large file over `conns` ranged connections into <name>.ppart, in DL_PIECE pieces handed out in
+    order, so the writes stay near the front (NTFS zero-fills the gap before a write far past the end).  The pieces
+    written are kept in <name>.ppart.json after each one, so a stopped download resumes with at most `conns`
+    pieces fetched again.  A <name>.part of an earlier, single-connection run is taken over with its bytes.  At the
+    end the whole file is <name>.part, which download() renames as before.  Returns False, with nothing kept, when
+    the server ignores ranges; stops setup when a piece cannot be fetched after 10 tries."""
+    import concurrent.futures
+    import threading
+
+    part = dst.with_name(dst.name + ".part")
+    ppart = dst.with_name(dst.name + ".ppart")
+    state_file = parallel_state(dst)
+    state = None
+    if state_file.exists() and ppart.exists():
+        try:
+            state = json.loads(state_file.read_text())
+            if state.get("total") != total or state.get("piece") != DL_PIECE:
+                state = None                           # another file (or setup) under that name: start over
+        except (OSError, ValueError):
+            state = None
+    if state is None:
+        ppart.unlink(missing_ok=True)
+        start = part.stat().st_size if part.exists() else 0
+        start = start if start < total else 0
+        state = {"total": total, "piece": DL_PIECE, "start": start, "done": []}
+        state_file.write_text(json.dumps(state))       # first, so a .ppart never exists without its progress file
+        if start:
+            part.replace(ppart)                        # its bytes are the first `start` of the file
+        else:
+            part.unlink(missing_ok=True)
+            ppart.touch()
+    start = state["start"]
+    pieces = [(start + i * DL_PIECE, min(total, start + (i + 1) * DL_PIECE))
+              for i in range(-(-(total - start) // DL_PIECE))]
+    finished = set(state["done"])
+    todo = [i for i in range(len(pieces)) if i not in finished]
+    lock = threading.Lock()
+    stop = threading.Event()
+    have = [start + sum(pieces[i][1] - pieces[i][0] for i in finished)]
+
+    def fetch(i):
+        lo, hi = pieces[i]
+        for attempt in range(10):
+            if stop.is_set():
+                return
+            got = 0
+            try:
+                req = urllib.request.Request(url, headers={"User-Agent": "strata-setup", "Range": f"bytes={lo}-{hi - 1}"})
+                with urllib.request.urlopen(req, timeout=60) as r:
+                    if r.status != 206 or not str(r.headers.get("Content-Range", "")).startswith(f"bytes {lo}-"):
+                        raise NoRanges()
+                    with open(ppart, "r+b") as f:
+                        f.seek(lo)
+                        while not stop.is_set():
+                            b = r.read(1 << 20)
+                            if not b:
+                                break
+                            f.write(b)
+                            got += len(b)
+                            with lock:
+                                have[0] += len(b)
+                if got == hi - lo:
+                    with lock:
+                        finished.add(i)
+                        state["done"] = sorted(finished)
+                        state_file.write_text(json.dumps(state))
+                    return
+                if stop.is_set():
+                    return
+                raise OSError(f"the connection closed after {got:,} of {hi - lo:,} bytes")
+            except OSError as e:
+                with lock:
+                    have[0] -= got
+                if attempt == 9:
+                    raise
+                if attempt == 2:
+                    print()
+                    warn(f"{what}: a piece was interrupted ({e}); retrying ...")
+                time.sleep(min(30, 3 * (attempt + 1)))
+
+    print(f"  {what}: {conns} connections", flush=True)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=conns)
+    futures = [pool.submit(fetch, i) for i in todo]    # a pool takes them in this order: front to back
+    error = None
+    try:
+        pending = set(futures)
+        t0, h0 = time.time(), have[0]
+        while pending:
+            gone, pending = concurrent.futures.wait(pending, timeout=2,
+                                                    return_when=concurrent.futures.FIRST_EXCEPTION)
+            error = next((f.exception() for f in gone if f.exception() is not None), None)
+            if error is not None:
+                break
+            rate = (have[0] - h0) / max(time.time() - t0, 1e-3) / 1e6
+            print(f"\r  {what}: {have[0] / 1e9:6.2f} / {total / 1e9:.2f} GB ({100 * have[0] / total:.0f}%), "
+                  f"{rate:5.1f} MB/s   ", end="", flush=True)
+    finally:
+        stop.set()                                     # the rest stop after their current read
+        for f in futures:
+            f.cancel()
+        pool.shutdown(wait=True)
+    print()
+    if isinstance(error, NoRanges):
+        warn(f"{what}: the server does not send parts of the file; downloading it over one connection")
+        ppart.unlink(missing_ok=True)
+        state_file.unlink(missing_ok=True)
+        return False
+    if error is not None:
+        fail(f"could not finish downloading {dst.name} ({error})",
+             "check your internet connection and run it again (the download resumes where it stopped)")
+    if len(finished) != len(pieces) or ppart.stat().st_size != total:
+        fail(f"could not finish downloading {dst.name}: {ppart.stat().st_size:,} bytes on disk, the server says "
+             f"{total:,}", "run it again (the download resumes where it stopped)")
+    ppart.replace(part)
+    state_file.unlink(missing_ok=True)
+    return True
+
+
 def download(url, dst: Path, what=None):
     """Resumable HTTP(S) download with a progress line; `file://` and plain paths are copied (tests, mirrors).
     A finished file gets a <name>.done mark, so a later run skips it without asking the server."""
@@ -2196,6 +2343,12 @@ def download(url, dst: Path, what=None):
         ok(f"{what or dst.name} already downloaded")
         return
     have = part.stat().st_size if part.exists() else 0
+    conns = download_connections()
+    if total and conns > 1 and (parallel_state(dst).exists() or total - have >= 2 * DL_PIECE):
+        if download_parallel(url, dst, total, what or dst.name, conns):
+            have = total                               # the .part is whole: the loop below only finishes it
+        else:
+            have = part.stat().st_size if part.exists() else 0
     for attempt in range(30):
         if total and have >= total:                    # stopped after the last byte, before the rename: nothing to
             break                                      # ask for (a range past the end is a 416, retried 30 times)
@@ -7020,7 +7173,7 @@ def poly_setup(a, family, gpu, hip, cuda_tk, multi, ram, data, elsewhere, port, 
             warn(f"found several files with 'mmproj' in {models_dir}: {names}\n"
                  f"renaming one to exactly {fam['mmproj']}, or deleting the others")
     have_mmproj = mmproj is None or mmproj.exists() and (done(mmproj) or bool(a.gguf_dir) or whole_shard(mmproj))
-    on_disk = sum(f.stat().st_size for s in shards for f in (s, s.with_name(s.name + ".part")) if f.is_file()) / 1e9
+    on_disk = sum(f.stat().st_size for s in shards for f in (s, s.with_name(s.name + ".part"), s.with_name(s.name + ".ppart")) if f.is_file()) / 1e9
     need = (0 if have_model and have_guesser else max(d["download_gb"] - on_disk, 0)) + \
         (0 if have_mmproj else fam["vision_gb"]) + 2
     if free_gb(models_dir) < need:
@@ -7504,8 +7657,7 @@ def install_own_path(a, family, gpu, hip, amd, cuda_tk, multi, port, ram, adopte
     folder = Path(a.gguf_dir) if a.gguf_dir else Path(a.models_dir) / tag
     gguf = (_sg[0] if _sg else folder / fam["file"].format(q=model))
     size = fam["sha256"].get(gguf.name, [0])[0]
-    part = gguf.with_name(gguf.name + ".part")
-    left = 0 if gguf.exists() and done(gguf) else (size - (part.stat().st_size if part.is_file() else 0)) / 1e9
+    left = 0 if gguf.exists() and done(gguf) else (size - partial_size(gguf)) / 1e9
     if left and free_gb(folder) < left + 1:
         fail(f"not enough free disk space in {folder}: need ~{left + 1:.0f} GB", "use --models-dir on a bigger drive")
 
@@ -7650,8 +7802,7 @@ def preview_family(a) -> int:
         want.append(fam["mmproj"])
     folder = Path(a.models_dir) / (fam["tag"] + model)
     files = [folder / w for w in want]
-    left = sum(fam["sha256"][f.name][0] - (f.with_name(f.name + ".part").stat().st_size
-                                           if f.with_name(f.name + ".part").is_file() else 0)
+    left = sum(fam["sha256"][f.name][0] - partial_size(f)
                for f in files if not (f.exists() and done(f))) / 1e9
     if left and free_gb(folder) < left + 1:
         fail(f"not enough free disk space in {folder}: need ~{left + 1:.0f} GB", "use --models-dir on a bigger drive")
@@ -8536,7 +8687,7 @@ def main() -> int:
         all(s.exists() and (done(s) or a.gguf_dir) for s in shards)
     # #425 (jctaborda): a download that resumes needs room only for what is still missing - the finished shards and
     # the .part files already on the disk count
-    on_disk = sum(f.stat().st_size for s in shards for f in (s, s.with_name(s.name + ".part")) if f.is_file()) / 1e9
+    on_disk = sum(f.stat().st_size for s in shards for f in (s, s.with_name(s.name + ".part"), s.with_name(s.name + ".ppart")) if f.is_file()) / 1e9
     to_fetch = 0 if a.gguf_dir or have_model else max(MODELS[model]["download_gb"] - on_disk, 0)
     # count only what step 6 will still write: a pack whose experts.bin is already there (the AVX-512 Q2_0
     # conversion, or the low-RAM mode's copy) and an existing MTP draft layer need no new room
